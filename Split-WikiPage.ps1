@@ -1,4 +1,16 @@
-$wikiBaseUrl = "https://wiki.migros.net"
+#
+# Split-ConfluencePage
+#
+
+param (
+    [Parameter(Mandatory=$true)]
+    [string]
+    $sourcePageUrl
+)
+
+$ErrorActionPreference = 'Stop'
+
+$wikiBaseUrl = $null
 if (-not $wikiCredentials) {
     $wikiCredentials = Get-Credential -Message "Bitte geben Sie Nutzername und Passwort für den Zugriff auf Confluence ein"
 }
@@ -14,20 +26,44 @@ function Invoke-WikiRequest {
         $method,
 
         [Parameter()]
-        [string]$jsonContent
+        [string]$jsonContent,
+
+        [Parameter()]
+        [string]$outFile,
+
+        [Parameter()]
+        [string]$attachFile
     )
     
     if ($relativePath.StartsWith("https://")) {
         $finalUrl = $relativePath;
     } else {
+        if (-not $wikiBaseUrl) {
+            Write-Error "Wiki Base Url nicht konfiguriert und relative Url gefunden."
+        }
+
         $finalUrl = "$($wikiBaseUrl.TrimEnd('/'))/$($relativePath.TrimStart('/'))";
     }
 
     if ($jsonContent) {
-        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -Method $method -Body ([System.Text.Encoding]::UTF8.GetBytes($jsonContent)) -ContentType "application/json" -Verbose #-proxy "http://webproxy.dc.migros.ch:9099"
-    } else {
-        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic #-proxy "http://webproxy.dc.migros.ch:9099"
+        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -Method $method -Body ([System.Text.Encoding]::UTF8.GetBytes($jsonContent)) -ContentType "application/json" #-proxy "http://webproxy.dc.migros.ch:9099"
     }
+    if ($attachFile) {
+        $FileStream = [System.IO.FileStream]::new($attachFile, [System.IO.FileMode]::Open)
+        $FileHeader = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new('form-data')
+        $FileHeader.Name = "file"
+        $FileHeader.FileName = Split-Path -leaf $attachFile
+        $FileContent = [System.Net.Http.StreamContent]::new($FileStream)
+        $FileContent.Headers.ContentDisposition = $FileHeader
+        
+        $MultipartContent = [System.Net.Http.MultipartFormDataContent]::new()
+        $MultipartContent.Add($FileContent)
+        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -Method $method -Body $MultipartContent -Headers @{ "X-Atlassian-Token" = "no-check" } #-proxy "http://webproxy.dc.migros.ch:9099"
+    }
+    if ($outFile) {
+        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -OutFile $outFile #-proxy "http://webproxy.dc.migros.ch:9099"
+    }
+    return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic #-proxy "http://webproxy.dc.migros.ch:9099"
 }
 
 function Write-NewConfluencePage {
@@ -123,13 +159,11 @@ $content
 "@    
 }
 
-$sourcePageUrl = "https://wiki.migros.net/pages/viewpage.action?pageId=441044511"
-
 # get page id
 $sourcePageRendered = [string](Invoke-WikiRequest $sourcePageUrl)
 if ($sourcePageRendered -match '\<meta\sname="ajs-page-id"\scontent="(?<pageid>\d+)"') {
     $pageid = $matches.pageid
-    Write-Output "Seite $pageid wird verarbeitet..."
+    Write-Host "Seite $pageid wird verarbeitet..."
 } else {
     Write-Error "Die Seitennummer konnte nicht ausgelesen werden. Bitte Url prüfen."
 }
@@ -142,6 +176,11 @@ if ($sourcePageRendered -match '\<meta\sname="ajs-page-title"\scontent="(?<paget
     $pageTitle = $matches.pagetitle
 } else {
     Write-Error "Der Space-Key konnte nicht ausgelesen werden. Bitte Url prüfen."
+}
+if ($sourcePageRendered -match '\<meta\sname="ajs-base-url"\scontent="(?<baseurl>[^"]+)"') {
+    $wikiBaseUrl = $matches.baseurl
+} else {
+    Write-Error "Die Basis-Url konnte nicht ausgelesen werden. Bitte Url prüfen."
 }
 if ($sourcePageRendered -match '\<meta\sname="ajs-space-key"\scontent="(?<spacekey>\w+)"') {
     $spacekey = $matches.spacekey
@@ -165,12 +204,16 @@ $h1Nodes | ForEach-Object {
     $newDocument.LoadXml((WrapInHtmlContainer('')))
 
     $nodeToTransfer = $_
-    $nodeToRemove = $nodeToTransfer.SelectSingleNode("*");
+    $nsmgr = [System.Xml.XmlNamespaceManager]::new($sourcePageBodyXml.NameTable);
+    $nsmgr.AddNamespace("ac", "atlassian-confluence");
+    $nsmgr.AddNamespace("ri", "atlassian-confluence-ri");
+    $nodeToRemove = $nodeToTransfer.SelectSingleNode("ac:structured-macro[@ac:name='anchor']", $nsmgr);
     while ($nodeToRemove) {
         $removed = $nodeToTransfer.RemoveChild($nodeToRemove);
-        $nodeToRemove = $nodeToTransfer.SelectSingleNode("*");
+        $nodeToRemove = $nodeToTransfer.SelectSingleNode("ac:structured-macro[@ac:name='anchor']", $nsmgr);
     }
     $newPageTitle = "$($childPageNumber.ToString('00')). $($_.InnerText) ($pageid)"
+    Write-Host "Extrahiere Abschnitt '$newPageTitle'..."
 
     $nodeToTransfer = $_.NextSibling # die h1 an sich nicht übertragen
     while ($nodeToTransfer) {
@@ -194,14 +237,24 @@ $h1Nodes | ForEach-Object {
         }
     }
     
-    Write-Output "-----"
-    Write-Output "h1: $($_.InnerText)"
-    Write-Output $newDocument.OuterXml
+    $newPageResult = Write-NewConfluencePage -spaceKey $spaceKey -parentPageId $pageid -title $newPageTitle -content $newDocument.DocumentElement.InnerXml
+    $newPageId = (ConvertFrom-Json $newPageResult.Content).id
 
-    Write-NewConfluencePage -spaceKey $spaceKey -parentPageId $pageid -title $newPageTitle -content $newDocument.DocumentElement.InnerXml
-
+    # copy attachments
+    $nsmgr = [System.Xml.XmlNamespaceManager]::new($newDocument.NameTable);
+    $nsmgr.AddNamespace("ri", "atlassian-confluence-ri");
+    $attachmentsToCopy = $newDocument.SelectNodes("//ri:attachment/@ri:filename", $nsmgr)
+    if ($attachmentsToCopy.Count -gt 0) {
+        $attachmentsToCopy | ForEach-Object {
+            $attachmentName = $_.Value
+            Write-Host "  - übernehme Attachment '$attachmentName'"
+            $attatchmentDownloaded = Invoke-WikiRequest "/download/attachments/$pageid/$attachmentName" -outFile $attachmentName
+            $attatchmentUploaded = Invoke-WikiRequest "/rest/api/content/$newPageId/child/attachment" -method POST -attachFile $attachmentName
+            Remove-Item $attachmentName
+        }
+    }
     $childPageNumber = $childPageNumber+1
 }
 
 $remainingContent = $sourcePageBodyXml.DocumentElement.InnerXml
-Write-ExistingConfluencePage -pageId $pageid -spaceKey $spacekey -currentVersion $pageVersion -title $pageTitle -content $remainingContent
+$updatedPage = Write-ExistingConfluencePage -pageId $pageid -spaceKey $spacekey -currentVersion $pageVersion -title $pageTitle -content $remainingContent
