@@ -13,6 +13,9 @@ $ErrorActionPreference = 'Stop'
 $wikiBaseUrl = "https://wiki.migros.net/"
 if (-not $wikiCredentials) {
     $wikiCredentials = Get-Credential -Message "Bitte geben Sie Nutzername und Passwort für den Zugriff auf Confluence ein"
+    $pair = "$($wikiCredentials.UserName):$($wikiCredentials.GetNetworkCredential().Password)"
+    $encodedCreds = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pair))
+    $wikiBasicAuthValue = "Basic $encodedCreds"
 }
 
 function Invoke-WikiRequest {
@@ -46,24 +49,55 @@ function Invoke-WikiRequest {
     }
 
     if ($jsonContent) {
-        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -Method $method -Body ([System.Text.Encoding]::UTF8.GetBytes($jsonContent)) -ContentType "application/json" #-proxy "http://webproxy.dc.migros.ch:9099"
+        return Invoke-WebRequest $finalUrl -UseBasicParsing -Headers @{ Authorization = $wikiBasicAuthValue } -Method $method -Body ([System.Text.Encoding]::UTF8.GetBytes($jsonContent)) -ContentType "application/json" -proxy "http://webproxy.dc.migros.ch:9099"
     }
     if ($attachFile) {
-        $FileStream = [System.IO.FileStream]::new($attachFile, [System.IO.FileMode]::Open)
-        $FileHeader = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new('form-data')
-        $FileHeader.Name = "file"
-        $FileHeader.FileName = Split-Path -leaf $attachFile
-        $FileContent = [System.Net.Http.StreamContent]::new($FileStream)
-        $FileContent.Headers.ContentDisposition = $FileHeader
-        
-        $MultipartContent = [System.Net.Http.MultipartFormDataContent]::new()
-        $MultipartContent.Add($FileContent)
-        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -Method $method -Body $MultipartContent -Headers @{ "X-Atlassian-Token" = "no-check" } #-proxy "http://webproxy.dc.migros.ch:9099"
+        # Source: https://hochwald.net/upload-file-powershell-invoke-restmethod/
+		# The boundary is essential - Trust me, very essential
+		$boundary = [Guid]::NewGuid().ToString()
+		$bodyStart = @"
+--$boundary
+Content-Disposition: form-data; name="file"; filename="$(Split-Path -Leaf -Path $attachFile)"
+Content-Type: application/octet-stream
+
+
+"@
+		$bodyEnd = @"
+
+--$boundary--
+"@
+		$requestInFile = "$PSScriptRoot\payload.bin"
+        $fileStream = (New-Object -TypeName 'System.IO.FileStream' -ArgumentList ($requestInFile, [IO.FileMode]'Create', [IO.FileAccess]'Write'))
+
+        try
+        {
+            # The Body start
+            $bytes = [Text.Encoding]::UTF8.GetBytes($bodyStart)
+            $fileStream.Write($bytes, 0, $bytes.Length)
+
+            # The original File
+            $bytes = [IO.File]::ReadAllBytes($attachFile)
+            $fileStream.Write($bytes, 0, $bytes.Length)
+
+            # Append the end of the body part
+            $bytes = [Text.Encoding]::UTF8.GetBytes($bodyEnd)
+            $fileStream.Write($bytes, 0, $bytes.Length)
+        }
+        finally
+        {
+            # End the Stream to close the file
+            $fileStream.Close()
+        }
+
+        # Make it multipart, this is the magic part...
+        $contentType = 'multipart/form-data; boundary={0}' -f $boundary
+
+        $response = Invoke-RestMethod $finalUrl -UseBasicParsing -Headers @{ Authorization = $wikiBasicAuthValue; "X-Atlassian-Token" = "no-check" } -Method POST -InFile $requestInFile -ContentType $contentType -proxy "http://webproxy.dc.migros.ch:9099"
     }
     if ($outFile) {
-        return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic -OutFile $outFile #-proxy "http://webproxy.dc.migros.ch:9099"
+        return Invoke-WebRequest $finalUrl -UseBasicParsing -Headers @{ Authorization = $wikiBasicAuthValue } -OutFile $outFile -proxy "http://webproxy.dc.migros.ch:9099"
     }
-    return Invoke-WebRequest $finalUrl -UseBasicParsing -Credential $wikiCredentials -Authentication Basic #-proxy "http://webproxy.dc.migros.ch:9099"
+    return Invoke-WebRequest $finalUrl -UseBasicParsing -Headers @{ Authorization = $wikiBasicAuthValue } -proxy "http://webproxy.dc.migros.ch:9099"
 }
 
 function Write-NewConfluencePage {
@@ -96,7 +130,7 @@ function Write-NewConfluencePage {
         }
     };
     $jsonContent = [string](ConvertTo-Json $newPageObject);
-    [System.IO.File]::WriteAllText("payload.json", $jsonContent)
+    [System.IO.File]::WriteAllText("$PSScriptRoot\payload.json", $jsonContent)
 
     return Invoke-WikiRequest "/rest/api/content/" -Method POST -jsonContent $jsonContent
 }
@@ -134,7 +168,7 @@ function Write-ExistingConfluencePage {
         version = [PSCustomObject]@{ number = ($currentVersion + 1) };
     };
     $jsonContent = [string](ConvertTo-Json $newPageObject);
-    [System.IO.File]::WriteAllText("payload.json", $jsonContent)
+    [System.IO.File]::WriteAllText("$PSScriptRoot\payload.json", $jsonContent)
 
     return Invoke-WikiRequest "/rest/api/content/$($pageId)" -Method PUT -jsonContent $jsonContent
 }
@@ -166,10 +200,10 @@ $pageVersion = $sourcePageDataContent.version.number
 $pageTitle = $sourcePageDataContent.title
 $spaceKey = $sourcePageDataContent.space.key
 $sourcePageBody = $sourcePageDataContent.body.storage.value
-[System.IO.File]::WriteAllText("sourcepage.xml", (WrapInHtmlContainer($sourcePageBody)))
+[System.IO.File]::WriteAllText("$PSScriptRoot\sourcepage.xml", (WrapInHtmlContainer($sourcePageBody)))
 
 $sourcePageBodyXml = [System.Xml.XmlDocument]::new()
-$sourcePageBodyXml.LoadXml((Get-Content "sourcepage.xml" -Raw))
+$sourcePageBodyXml.LoadXml((Get-Content "$PSScriptRoot\sourcepage.xml" -Raw))
 
 $childPageNumber = 1
 $h1Nodes = $sourcePageBodyXml.DocumentElement.SelectNodes("//h1")
@@ -222,10 +256,12 @@ $h1Nodes | ForEach-Object {
     if ($attachmentsToCopy.Count -gt 0) {
         $attachmentsToCopy | ForEach-Object {
             $attachmentName = $_.Value
-            Write-Host "  - übernehme Attachment '$attachmentName'"
-            $attatchmentDownloaded = Invoke-WikiRequest "/download/attachments/$pageid/$attachmentName" -outFile $attachmentName
-            $attatchmentUploaded = Invoke-WikiRequest "/rest/api/content/$newPageId/child/attachment" -method POST -attachFile $attachmentName
-            Remove-Item $attachmentName
+            Write-Host "  - lade Attachment '$attachmentName'"
+            $attachmentDownloaded = Invoke-WikiRequest "/download/attachments/$pageid/$attachmentName" -outFile $PSScriptRoot\$attachmentName
+            Write-Host "  - schreibe Attachment '$attachmentName'"
+            $attachmentUploaded = Invoke-WikiRequest "/rest/api/content/$newPageId/child/attachment" -method POST -attachFile $PSScriptRoot\$attachmentName
+            Write-Host "  Attachment '$attachmentName' übertragen"
+            Remove-Item $PSScriptRoot\$attachmentName
         }
     }
     $childPageNumber = $childPageNumber+1
