@@ -5,12 +5,12 @@
 param (
     [Parameter(Mandatory=$true)]
     [string]
-    $sourcePageUrl
+    $pageid
 )
 
 $ErrorActionPreference = 'Stop'
 
-$wikiBaseUrl = $null
+$wikiBaseUrl = "https://wiki.migros.net/"
 if (-not $wikiCredentials) {
     $wikiCredentials = Get-Credential -Message "Bitte geben Sie Nutzername und Passwort für den Zugriff auf Confluence ein"
 }
@@ -159,38 +159,13 @@ $content
 "@    
 }
 
-# get page id
-$sourcePageRendered = [string](Invoke-WikiRequest $sourcePageUrl)
-if ($sourcePageRendered -match '\<meta\sname="ajs-page-id"\scontent="(?<pageid>\d+)"') {
-    $pageid = $matches.pageid
-    Write-Host "Seite $pageid wird verarbeitet..."
-} else {
-    Write-Error "Die Seitennummer konnte nicht ausgelesen werden. Bitte Url prüfen."
-}
-if ($sourcePageRendered -match '\<meta\sname="ajs-page-version"\scontent="(?<pageversion>\d+)"') {
-    $pageVersion = $matches.pageversion
-} else {
-    Write-Error "Die Seitenversion konnte nicht ausgelesen werden. Bitte Url prüfen."
-}
-if ($sourcePageRendered -match '\<meta\sname="ajs-page-title"\scontent="(?<pagetitle>[^"]+)"') {
-    $pageTitle = $matches.pagetitle
-} else {
-    Write-Error "Der Space-Key konnte nicht ausgelesen werden. Bitte Url prüfen."
-}
-if ($sourcePageRendered -match '\<meta\sname="ajs-base-url"\scontent="(?<baseurl>[^"]+)"') {
-    $wikiBaseUrl = $matches.baseurl
-} else {
-    Write-Error "Die Basis-Url konnte nicht ausgelesen werden. Bitte Url prüfen."
-}
-if ($sourcePageRendered -match '\<meta\sname="ajs-space-key"\scontent="(?<spacekey>\w+)"') {
-    $spacekey = $matches.spacekey
-} else {
-    Write-Error "Der Space-Key konnte nicht ausgelesen werden. Bitte Url prüfen."
-}
-
 #get page source
-$sourcePageData = Invoke-WikiRequest "/rest/api/content/$($pageid)?expand=body.storage"
-$sourcePageBody = (ConvertFrom-Json $sourcePageData.Content).body.storage.value
+$sourcePageData = Invoke-WikiRequest "/rest/api/content/$($pageid)?expand=body.storage,version,space"
+$sourcePageDataContent = (ConvertFrom-Json $sourcePageData.Content)
+$pageVersion = $sourcePageDataContent.version.number
+$pageTitle = $sourcePageDataContent.title
+$spaceKey = $sourcePageDataContent.space.key
+$sourcePageBody = $sourcePageDataContent.body.storage.value
 [System.IO.File]::WriteAllText("sourcepage.xml", (WrapInHtmlContainer($sourcePageBody)))
 
 $sourcePageBodyXml = [System.Xml.XmlDocument]::new()
